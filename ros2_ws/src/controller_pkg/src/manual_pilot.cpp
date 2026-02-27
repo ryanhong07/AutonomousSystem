@@ -20,6 +20,7 @@ public:
         traj_pub_ = this->create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>("/command/trajectory", 10);
         timer_ = this->create_wall_timer(100ms, std::bind(&ManualPilot::publish_traj, this));
 
+        // Starting coordinates and mission parameters
         tx_ = -36.0; ty_ = 10.0; tz_ = 10.0; current_yaw_ = 3.14159;
         current_state_ = NAV_TO_ENTRANCE;
         start_time_ = this->now();
@@ -41,40 +42,44 @@ private:
         if ((this->now() - start_time_).seconds() < 2.0) return;
         if (current_state_ == LOGGING || current_state_ == CLEARING_ZONE || current_state_ == MISSION_COMPLETE) return;
 
-        // Mode 2.0: Exploration (Fine-tuned for smoothness)
+        // Mode 2.0: Exploration (Follow the Brightness)
         if (msg->z == 2.0 && current_state_ == SEARCHING_CAVE) {
-            // Reduced from 0.012 to 0.008 for gentler turns
-            current_yaw_ -= msg->x * 0.008; 
-            // Reduced from 0.01 to 0.005 for stable altitude
-            tz_ += msg->y * 0.005; 
+            current_yaw_ -= msg->x * 0.008; // Smooth steering gain
+            tz_ += msg->y * 0.005; // Gentle altitude nudge
             return;
         }
 
-        // Mode 1.0: Hunting
+        // Mode 1.0: Hunting (Precision Approach Logic)
         if (msg->z != 2.0 && msg->z != 0.0) { 
             if (current_state_ == SEARCHING_CAVE) change_state(HUNTING, "Lantern Spotted.");
 
             if (current_state_ == HUNTING) {
-                double stop_threshold = 800000.0; 
-                // Reduced from 0.0015 to 0.001 for smooth centering
-                current_yaw_ -= msg->x * 0.001; 
+                double stop_threshold = 800000.0; // Stop when lantern is big
+                current_yaw_ -= msg->x * 0.001; // Constant centering
 
                 if (msg->y < stop_threshold) {
-                    tx_ += std::cos(current_yaw_) * 0.12;
-                    ty_ += std::sin(current_yaw_) * 0.12;
-                    tz_ -= msg->z * 0.008;
+                    // SLOW DOWN CONDITION: Speed drops from 0.12 to 0.06 when diving starts
+                    double hunt_speed = (msg->y > 100000.0) ? 0.1 : 0.12; 
+                    
+                    tx_ += std::cos(current_yaw_) * hunt_speed;
+                    ty_ += std::sin(current_yaw_) * hunt_speed;
+
+                    // DELAYED DIVE CONDITION: Only dive when lantern area is > 50,000
+                    if (msg->y > 50000.0) {
+                        tz_ -= msg->z * 0.002; // Proportional descent
+                    }
                 } else {
                     reach_time_ = this->now();
                     found_lanterns_.push_back({tx_, ty_, tz_});
                     RCLCPP_INFO(this->get_logger(), "Lantern #%ld Found!", found_lanterns_.size());
                     
-                    clearing_target_z_ = tz_ + 10.0;
-                    change_state(LOGGING, "LOGGING: Holding position for 2s.");
+                    clearing_target_z_ = tz_ + 10.0; // Safety climb target
+                    change_state(LOGGING, "LOGGING: Holding for 2s.");
                 }
             }
         } 
         else if (current_state_ == HUNTING) {
-            change_state(SEARCHING_CAVE, "Visual lost. Gentler recovery.");
+            change_state(SEARCHING_CAVE, "Visual lost. Resuming search.");
         }
     }
 
@@ -82,45 +87,46 @@ private:
         if (current_state_ == NAV_TO_ENTRANCE) {
             double angle = std::atan2(entrance_.y - ty_, entrance_.x - tx_);
             current_yaw_ = angle;
-            tx_ += std::cos(current_yaw_) * 0.20; // Reduced transit speed for stability
+            tx_ += std::cos(current_yaw_) * 0.20; // Stable transit speed
             ty_ += std::sin(current_yaw_) * 0.20;
             if (tz_ < entrance_.z) tz_ += 0.08;
             if (std::sqrt(std::pow(entrance_.x-tx_,2)+std::pow(entrance_.y-ty_,2)) < 3.0) 
-                change_state(SEARCHING_CAVE, "EXPLORING.");
+                change_state(SEARCHING_CAVE, "EXPLORING CAVE.");
         }
         else if (current_state_ == SEARCHING_CAVE) {
-            // Reduced from 0.12 to 0.10 to help computer lag
-            tx_ += std::cos(current_yaw_) * 0.10;
+            tx_ += std::cos(current_yaw_) * 0.10; // Exploration speed
             ty_ += std::sin(current_yaw_) * 0.10;
         }
         else if (current_state_ == LOGGING) {
-            if ((this->now() - reach_time_).seconds() >= 2.0) {
+            if ((this->now() - reach_time_).seconds() >= 2.0) { // Hover for 2 seconds
                 if (found_lanterns_.size() >= 4) {
-                    change_state(MISSION_COMPLETE, "MISSION SUCCESS: All 4 logged.");
+                    change_state(MISSION_COMPLETE, "MISSION SUCCESS.");
                 } else {
-                    change_state(CLEARING_ZONE, "EVADING: STEP 1 - Vertical Climb.");
+                    change_state(CLEARING_ZONE, "EVADING: Climbing 10m.");
                     reach_time_ = this->now();
                 }
             }
         }
         else if (current_state_ == CLEARING_ZONE) {
+            // STEP 1: Vertical Climb Only
             if (tz_ < (clearing_target_z_ - 0.1)) {
-                tz_ += 0.4; // Slightly slower climb rate for stability
+                tz_ += 0.4; 
                 reach_time_ = this->now(); 
-            } else {
-                // Reduced from 0.15 to 0.12 for smoother recovery
+            } 
+            // STEP 2: Move Forward for 10s to clear the lantern
+            else {
                 tx_ += std::cos(current_yaw_) * 0.12; 
                 ty_ += std::sin(current_yaw_) * 0.12;
 
                 if ((this->now() - reach_time_).seconds() >= 10.0) {
-                    change_state(SEARCHING_CAVE, "RESUMING SEARCH.");
+                    change_state(SEARCHING_CAVE, "SEARCHING DEEPER.");
                 }
             }
         }
         else if (current_state_ == MISSION_COMPLETE) {
             static bool summary_printed = false;
             if (!summary_printed) {
-                RCLCPP_INFO(this->get_logger(), "========= LANTERN SUMMARY =========");
+                RCLCPP_INFO(this->get_logger(), "========= MISSION SUMMARY =========");
                 for(size_t i=0; i < found_lanterns_.size(); ++i) {
                     RCLCPP_INFO(this->get_logger(), "Lantern %ld: [X: %.2f, Y: %.2f, Z: %.2f]", 
                                 i+1, found_lanterns_[i].x, found_lanterns_[i].y, found_lanterns_[i].z);
