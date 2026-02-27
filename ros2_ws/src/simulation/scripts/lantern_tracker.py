@@ -30,6 +30,11 @@ class LanternTracker(Node):
                 self.lantern_x_err = float((moments["m10"] / moments["m00"]) - 160.0)
                 self.lantern_y_err = float((moments["m01"] / moments["m00"]) - 120.0) # Vertical error
                 self.lantern_area = float(moments["m00"])
+                
+                # --- NEW REAL-TIME OUTPUT ---
+                # This will print the current area of the yellow region to your terminal
+                self.get_logger().info(f"Yellow Region Area: {self.lantern_area:.2f}")
+                # ----------------------------
             else:
                 self.lantern_found = False
         except: pass
